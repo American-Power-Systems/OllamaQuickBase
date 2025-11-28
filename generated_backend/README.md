@@ -22,12 +22,21 @@ This app is headless (no user interface). It accepts tasks via a REST API, proce
 1.  **Trigger:** A document is emailed to QuickBase.
 2.  **OCR:** QuickBase triggers our Replit App, which extracts raw text from the attachment.
 3.  **Hand-off:** The Replit App sends a payload to this Azure Application.
-    *   Payload: `{ "record_id": 123, "po_text": "...", "prompt_json": {...} }`
+    *   **Payload:**
+        ```json
+        {
+          "record_id": 123,
+          "po_text": "Raw OCR text...",
+          "target_table_id": "bck7...",
+          "target_field_ids": {"payment_terms": 6, "total": 7},
+          "prompt_json": {"payment_terms": "string", "total": "string"}
+        }
+        ```
 4.  **Queue:** This app accepts the payload and adds it to a Redis Job Queue (responding immediately with "202 Accepted").
 5.  **Processing:** A background Worker Process pulls the job:
     *   Feeds `po_text` and `prompt_json` into the local Ollama (Llama 3) model.
     *   Waits for the AI to extract the JSON answers (approx. 3-5 mins per doc).
-6.  **Completion:** The Worker uses the QuickBase API to update the original Record #123 with the extracted data.
+6.  **Completion:** The Worker uses the `target_table_id` and `target_field_ids` to write the results directly back to QuickBase.
 
 ## 3. Technical Stack
 
@@ -49,6 +58,7 @@ This application is deployed on a standard Azure Virtual Machine (Ubuntu 22.04 L
 ## 5. Deployment
 
 Deployments are automated via GitHub Actions.
+**Important:** This repository contains both a frontend (client) and backend (generated_backend). For the Azure AI Processor, we only deploy the contents of `generated_backend`.
 
 1.  **Push to main:** Triggers the pipeline.
 2.  **Action:** SSHs into the Azure VM, pulls the latest code, updates dependencies (`pip install`), and restarts the systemd services.

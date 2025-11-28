@@ -15,32 +15,31 @@ redis_conn = Redis(
 # RQ Queue
 q = Queue(connection=redis_conn)
 
-@app.route('/process_po', methods=['POST'])
+@app.route('/api/process_po', methods=['POST'])
 def process_po():
     try:
         data = request.get_json()
         
-        # Validate required fields
-        required_fields = ['record_id', 'po_text']
-        if not all(field in data for field in required_fields):
-            return jsonify({'error': 'Missing required fields: record_id, po_text'}), 400
-            
-        record_id = data['record_id']
-        po_text = data['po_text']
-        prompt = data.get('prompt', 'Extract key details from this PO')
+        # Validate required fields for the "Stateless" design
+        required_fields = ['record_id', 'po_text', 'target_table_id', 'target_field_ids', 'prompt_json']
+        missing = [field for field in required_fields if field not in data]
         
-        # Enqueue the job
+        if missing:
+            return jsonify({'error': f'Missing required fields: {", ".join(missing)}'}), 400
+            
+        # Enqueue the job - passing the entire data object to the worker
+        # This allows the worker to know WHICH table and fields to update
         from worker import process_po_job
         job = q.enqueue(
             process_po_job,
-            args=(record_id, po_text, prompt),
-            job_timeout='5m'
+            args=(data,), # Pass the whole dict as one argument
+            job_timeout='10m' # Increased timeout for CPU inference
         )
         
         return jsonify({
             'status': 'queued',
             'job_id': job.get_id(),
-            'message': f'PO {record_id} added to queue'
+            'message': f'Record {data["record_id"]} added to queue'
         }), 202
         
     except Exception as e:
