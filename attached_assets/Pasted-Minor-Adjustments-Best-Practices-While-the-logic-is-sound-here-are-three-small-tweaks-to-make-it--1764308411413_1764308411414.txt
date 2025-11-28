@@ -1,0 +1,32 @@
+Minor Adjustments & Best Practices
+While the logic is sound, here are three small tweaks to make it production-ready on Azure:
+
+A. Request Timeout in worker.py In worker.py, the call to requests.post(OLLAMA_URL, ...) will default to a standard timeout (often infinite, but sometimes shorter depending on system settings). Since CPU inference can take 3-5 minutes, it's safer to explicitly set a long timeout.
+
+Change:
+
+Python
+
+response = requests.post(OLLAMA_URL, json=payload, timeout=600) # 10 minute timeout
+B. QuickBase "Upsert" Endpoint The code uses https://api.quickbase.com/v1/records. This is the correct endpoint for creating/updating records. Ensure the QUICKBASE_USER_TOKEN environment variable is set correctly in your Azure configuration (or .env file if testing locally).
+
+C. Error Handling in worker.py The process_po_job function catches exceptions but only prints them. In a production system, it is highly recommended to write the error back to QuickBase so the user knows something went wrong.
+
+Improvement: If the payload includes an optional error_field_id, the worker could write the error message there.
+
+Python
+
+except Exception as e:
+    print(f"Job failed for {record_id}: {e}")
+    if 'error_field_id' in data:
+         # Logic to update QuickBase record with error message
+         pass
+    raise e
+4. The Frontend (client/)
+You likely do not need the React frontend (client/ folder) for your actual Azure deployment.
+
+Replit generated a UI: The files src/App.tsx, src/pages/dashboard.tsx, etc., create a web dashboard to view the queue.
+
+Your Use Case: Your application is "headless"—it talks API-to-API. You don't strictly need a visual dashboard to process POs.
+
+Recommendation: For the initial deployment, you can ignore the client folder and focus entirely on deploying the generated_backend folder to your Azure VM. The dashboard.tsx is a nice-to-have for debugging, but it adds complexity (serving static files, setting up Nginx) that isn't strictly necessary for the core job.

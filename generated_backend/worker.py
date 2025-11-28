@@ -38,7 +38,7 @@ Respond ONLY with valid JSON that matches this schema.
     }
     
     try:
-        response = requests.post(OLLAMA_URL, json=payload)
+        response = requests.post(OLLAMA_URL, json=payload, timeout=600) # 10 minute timeout
         response.raise_for_status()
         # Ollama returns the response object, we need the 'response' string inside it
         return json.loads(response.json().get('response', '{}'))
@@ -88,10 +88,37 @@ def update_quickbase(record_id, target_table_id, target_field_ids, ai_data):
         print(f"Attempted Body: {json.dumps(body)}") # Log payload for debugging
         raise
 
+def update_quickbase_error(record_id, target_table_id, error_field_id, error_message):
+    """
+    Write an error message back to QuickBase if processing fails.
+    """
+    headers = {
+        'QB-Realm-Hostname': QUICKBASE_REALM,
+        'User-Agent': 'Python-Worker',
+        'Authorization': f'QB-USER-TOKEN {QUICKBASE_USER_TOKEN}',
+        'Content-Type': 'application/json'
+    }
+    
+    body = {
+        "to": target_table_id,
+        "data": [
+            {
+                "3": {"value": record_id},
+                str(error_field_id): {"value": str(error_message)}
+            }
+        ]
+    }
+    
+    try:
+        requests.post(QUICKBASE_URL, headers=headers, json=body)
+    except Exception as e:
+        print(f"Failed to report error to QuickBase: {e}")
+
 def process_po_job(data):
     """
     The worker task function.
     Expects 'data' dict with: record_id, po_text, target_table_id, target_field_ids, prompt_json
+    Optional: error_field_id
     """
     record_id = data['record_id']
     print(f"Processing Job for Record: {record_id}")
@@ -115,7 +142,17 @@ def process_po_job(data):
         
     except Exception as e:
         print(f"Job failed for {record_id}: {e}")
-        # Optional: Write error back to QuickBase if an 'error_fid' was provided
+        
+        # Write error back to QuickBase if an 'error_field_id' was provided
+        if 'error_field_id' in data and 'target_table_id' in data:
+            print(f"Reporting error to QuickBase field {data['error_field_id']}...")
+            update_quickbase_error(
+                record_id,
+                data['target_table_id'],
+                data['error_field_id'],
+                str(e)
+            )
+            
         raise e
 
 if __name__ == '__main__':
