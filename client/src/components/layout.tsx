@@ -56,7 +56,8 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 generated_backend/<br/>
                 ├── app.py<br/>
                 ├── worker.py<br/>
-                └── requirements.txt
+                ├── requirements.txt<br/>
+                └── README.md
               </div>
            </div>
         </div>
