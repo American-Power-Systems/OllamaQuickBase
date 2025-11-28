@@ -9,7 +9,7 @@ This application is a private, self-hosted AI microservice designed to extract s
 **Key Benefits:**
 *   **Data Privacy:** Zero data egress. All processing happens on our private Azure VM.
 *   **Cost Control:** Uses a fixed-cost CPU server with a job queue, eliminating variable per-token API fees.
-*   **Flexibility:** "Stateless" design allows QuickBase to dynamically dictate the extraction logic via JSON prompts.
+*   **Flexibility:** "Stateless" design allows QuickBase to dynamically dictate the extraction logic via JSON prompts stored in a QuickBase "Prompt Library".
 
 ## 2. System Architecture
 
@@ -34,7 +34,7 @@ This app is headless (no user interface). It accepts tasks via a REST API, proce
         ```
 4.  **Queue:** This app accepts the payload and adds it to a Redis Job Queue (responding immediately with "202 Accepted").
 5.  **Processing:** A background Worker Process pulls the job:
-    *   Feeds `po_text` and `prompt_json` into the local Ollama (Llama 3) model.
+    *   Feeds `po_text` and `prompt_json` (received from QuickBase) into the local Ollama (Llama 3) model.
     *   Waits for the AI to extract the JSON answers (approx. 3-5 mins per doc).
 6.  **Completion:** The Worker uses the `target_table_id` and `target_field_ids` to write the results directly back to QuickBase.
 
