@@ -2,14 +2,14 @@
 
 ## 1. Executive Summary
 
-This application is a private, self-hosted AI microservice designed to extract structured data from unstructured documents (Purchase Orders, Invoices, etc.).
+This application is a private, self-hosted AI microservice designed to extract structured data from unstructured documents (Purchase Orders, Contracts, Invoices, etc.).
 
 **Purpose:** To replace our previous OpenAI-based workflow with a 100% "closed" model. This migration is driven by customer compliance requirements to ensure sensitive document data never leaves our internal Azure environment or is sent to third-party public APIs.
 
 **Key Benefits:**
 *   **Data Privacy:** Zero data egress. All processing happens on our private Azure VM.
 *   **Cost Control:** Uses a fixed-cost CPU server with a job queue, eliminating variable per-token API fees.
-*   **Flexibility:** "Stateless" design allows QuickBase to dynamically dictate the extraction logic via JSON prompts stored in a QuickBase "Prompt Library".
+*   **Flexibility:** "Stateless" design allows QuickBase to dynamically dictate the extraction logic. **You can change the questions (prompts) and the destination fields at any time without changing the code.**
 
 ## 2. System Architecture
 
@@ -28,14 +28,20 @@ This app is headless (no user interface). It accepts tasks via a REST API, proce
           "record_id": 123,
           "po_text": "Raw OCR text...",
           "target_table_id": "bck7...",
-          "target_field_ids": {"payment_terms": 6, "total": 7},
-          "prompt_json": {"payment_terms": "string", "total": "string"}
+          "target_field_ids": {
+             "insurance_requirements": 45, 
+             "payment_terms": 6
+          },
+          "prompt_json": {
+             "insurance_requirements": "What are the insurance requirements in this contract?", 
+             "payment_terms": "What are the payment terms?"
+          }
         }
         ```
 4.  **Queue:** This app accepts the payload and adds it to a Redis Job Queue (responding immediately with "202 Accepted").
 5.  **Processing:** A background Worker Process pulls the job:
     *   Feeds `po_text` and `prompt_json` (received from QuickBase) into the local Ollama (Llama 3) model.
-    *   Waits for the AI to extract the JSON answers (approx. 3-5 mins per doc).
+    *   Waits for the AI to extract the JSON answers.
 6.  **Completion:** The Worker uses the `target_table_id` and `target_field_ids` to write the results directly back to QuickBase.
 
 ## 3. Technical Stack
@@ -53,7 +59,7 @@ This application is deployed on a standard Azure Virtual Machine (Ubuntu 22.04 L
 *   **Scaling:** The system is designed to handle ~100 documents/day sequentially. If volume increases significantly, we can vertically scale the VM or add more Worker processes.
 *   **Maintenance:**
     *   Logs are managed via systemd (services: `ai-api` and `ai-worker`).
-    *   To update the extraction logic (e.g., adding a new field), do not edit this code. Update the JSON Prompt stored in the QuickBase "Prompt Library" table.
+    *   To update the extraction logic (e.g., asking "Where are the insurance requirements?" instead of "What are they?"), **do not edit this code**. Simply update the JSON Prompt stored in your QuickBase "Prompt Library". The app will automatically process the new question.
 
 ## 5. Deployment
 

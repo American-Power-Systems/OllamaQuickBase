@@ -12,6 +12,8 @@ export default function SubmitPO() {
   const { toast } = useToast();
   const [isLoading, setIsLoading] = useState(false);
   
+  const [mode, setMode] = useState<"po" | "contract">("po");
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
@@ -21,7 +23,7 @@ export default function SubmitPO() {
       setIsLoading(false);
       toast({
         title: "Job Enqueued",
-        description: "PO Record added to Redis Queue for processing.",
+        description: `Document sent to Redis. Mode: ${mode === "po" ? "PO Extraction" : "Contract Analysis"}`,
       });
     }, 1500);
   };
@@ -31,29 +33,61 @@ export default function SubmitPO() {
       <div className="max-w-2xl mx-auto">
         <Card>
           <CardHeader>
-            <CardTitle>Submit Purchase Order</CardTitle>
-            <CardDescription>
-              Manually trigger a job for the worker. This mimics the POST request to <code className="bg-muted px-1 py-0.5 rounded text-xs font-mono">/process_po</code>
-            </CardDescription>
+            <div className="flex items-center justify-between">
+               <div>
+                <CardTitle>Submit Document</CardTitle>
+                <CardDescription>
+                  Manually trigger a job. This mimics the POST request to <code className="bg-muted px-1 py-0.5 rounded text-xs font-mono">/process_po</code>
+                </CardDescription>
+               </div>
+               <div className="flex bg-muted p-1 rounded-lg">
+                 <button 
+                    onClick={() => setMode("po")}
+                    className={`px-3 py-1 text-xs font-medium rounded-md transition-all ${mode === "po" ? "bg-white shadow text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                 >
+                    PO Mode
+                 </button>
+                 <button 
+                    onClick={() => setMode("contract")}
+                    className={`px-3 py-1 text-xs font-medium rounded-md transition-all ${mode === "contract" ? "bg-white shadow text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+                 >
+                    Contract Mode
+                 </button>
+               </div>
+            </div>
           </CardHeader>
           <form onSubmit={handleSubmit}>
             <CardContent className="space-y-4">
               <div className="space-y-2">
                 <Label htmlFor="record-id">Record ID</Label>
-                <Input id="record-id" placeholder="e.g., PO-2024-8821" required />
+                <Input id="record-id" placeholder="e.g., DOC-2024-8821" required />
               </div>
               
               <div className="space-y-2">
-                <Label htmlFor="prompt">Analysis Prompt</Label>
-                <Input id="prompt" defaultValue="Extract key details: Vendor, Total Amount, and Approval Status" />
+                <div className="flex justify-between">
+                  <Label htmlFor="prompt">Analysis Prompt (JSON)</Label>
+                  <span className="text-xs text-muted-foreground">Dynamic Schema</span>
+                </div>
+                <Textarea 
+                  id="prompt" 
+                  className="font-mono text-xs bg-slate-50 text-slate-600 min-h-[100px]"
+                  value={mode === "po" 
+                    ? '{\n  "vendor": "Extract the vendor name",\n  "total": "Extract the total amount"\n}' 
+                    : '{\n  "insurance_reqs": "Where are the insurance requirements located?",\n  "liability_limit": "What is the liability limit?"\n}'
+                  } 
+                  readOnly
+                />
+                <p className="text-[10px] text-muted-foreground">
+                   * This JSON tells the Worker WHAT to extract. It can be changed per-document.
+                </p>
               </div>
 
               <div className="space-y-2">
-                <Label htmlFor="po-text">PO Content / Text</Label>
+                <Label htmlFor="po-text">Document Text</Label>
                 <Textarea 
                   id="po-text" 
-                  placeholder="Paste the full text of the Purchase Order here..." 
-                  className="min-h-[200px] font-mono text-sm"
+                  placeholder={mode === "po" ? "Paste Purchase Order text..." : "Paste Contract text..."}
+                  className="min-h-[150px] font-mono text-sm"
                   required 
                 />
               </div>
