@@ -1,0 +1,25 @@
+ED25519 key fingerprint is SHA256:icdzoi8EDPF9DExNrXphFKxjQcg3fUNlshHd5dcOsaU.
+This host key is known by the following other names/addresses:
+    ~/.ssh/known_hosts:1: 20.84.72.199
+Are you sure you want to continue connecting (yes/no/[fingerprint])? yes
+Warning: Permanently added 'americanpower-ai.eastus.cloudapp.azure.com' (ED25519) to the list of known hosts.
+app.py                                                                                                                                                                     100% 1620     9.0KB/s   00:00    
+zsh: command not found: #
+worker.py                                                                                                                                                                  100% 5474    30.4KB/s   00:00    
+zsh: command not found: #
+requirements.txt                                                                                                                                                           100%   71     0.4KB/s   00:00    
+bengillihan@Mac-mini ~ % # 1. Download app.py
+scp -i ~/Downloads/ai-processor-vm_key.pem ubuntu@americanpower-ai.eastus.cloudapp.azure.com:~/ai-processor/generated_backend/app.py ~/Downloads/app.py
+
+# 2. Download worker.py
+scp -i ~/Downloads/ai-processor-vm_key.pem ubuntu@americanpower-ai.eastus.cloudapp.azure.com:~/ai-processor/generated_backend/worker.py ~/Downloads/worker.py
+
+# 3. Download requirements.txt
+scp -i ~/Downloads/ai-processor-vm_key.pem ubuntu@americanpower-ai.eastus.cloudapp.azure.com:~/ai-processor/generated_backend/requirements.txt ~/Downloads/requirements.txt
+zsh: command not found: #
+app.py                                                                                                                                                                     100% 1620     8.6KB/s   00:00    
+zsh: command not found: #
+worker.py                                                                                                                                                                  100% 5474    27.1KB/s   00:00    
+zsh: command not found: #
+requirements.txt                                                                                                                                                           100%   71     0.4KB/s   00:00    
+bengillihan@Mac-mini ~ % 
