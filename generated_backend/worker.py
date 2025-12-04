@@ -126,7 +126,10 @@ def update_quickbase_error(record_id, target_table_id, error_field_id, error_mes
 
 def process_po_job(data):
     record_id = data['record_id']
-    print(f"Processing Job for Record: {record_id}")
+    # Extract the request name, defaulting to "Unknown" if not provided
+    request_name = data.get('request_name', 'Unknown Request')
+    
+    print(f"Processing Job: '{request_name}' for Record: {record_id}")
 
     # --- GUARD RAILS ---
     if not data.get('po_text') or len(data['po_text'].strip()) < 10:
