@@ -41,7 +41,8 @@ def process_po():
         job = q.enqueue(
             process_po_job,
             args=(data,),
-            job_timeout='10m'
+            # CHANGE: Increased from '10m' to '30m' to match the worker timeout
+            job_timeout='30m'
         )
         
         return jsonify({
