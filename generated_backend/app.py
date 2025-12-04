@@ -11,9 +11,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # 1. SECURITY: Enforce API Key from Environment
-API_KEY = os.getenv('API_KEY')
+API_KEY = os.getenv("API_KEY")
 if not API_KEY:
-    raise RuntimeError("CRITICAL: API_KEY environment variable must be set. Application failed to start.")
+    raise RuntimeError("API_KEY environment variable must be set")
 
 # Redis connection
 redis_conn = Redis(
