@@ -2,8 +2,17 @@ import os
 import requests
 import json
 import time
+import logging
+from typing import Dict, Any, Union
 from redis import Redis
 from rq import Worker, Queue, Connection
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # Configuration
 OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434/api/generate')
@@ -11,10 +20,27 @@ QUICKBASE_URL = os.getenv('QUICKBASE_URL', 'https://api.quickbase.com/v1/records
 QUICKBASE_USER_TOKEN = os.getenv('QUICKBASE_USER_TOKEN')
 QUICKBASE_REALM = os.getenv('QUICKBASE_REALM', 'your-realm.quickbase.com')
 
-def query_ollama(po_text, prompt_json):
-    """
-    Send text + schema to Ollama with HIGH FOCUS settings.
-    """
+# Redis Connection (Global)
+redis_conn = Redis(
+    host=os.getenv('REDIS_HOST', 'localhost'),
+    port=int(os.getenv('REDIS_PORT', 6379)),
+    password=os.getenv('REDIS_PASSWORD', None)
+)
+
+def log_safe_event(message: str):
+    """Logs a message to stdout (for systemd) AND pushes it to Redis (for Dashboard)."""
+    logger.info(message)
+    timestamp = time.strftime("%H:%M:%S")
+    log_entry = f"[{timestamp}] {message}"
+    try:
+        # Push to 'monitor_logs' list and keep only last 100
+        redis_conn.lpush("monitor_logs", log_entry)
+        redis_conn.ltrim("monitor_logs", 0, 99) 
+    except Exception as e:
+        logger.warning(f"Could not push log to Redis: {e}")
+
+def query_ollama(po_text: str, prompt_json: Dict[str, str]) -> Dict[str, Any]:
+    """Send text + schema to Ollama."""
     system_instruction = (
         "You are an expert legal contract analyst. "
         "Your job is to read the ENTIRE document provided and generate accurate, comprehensive summaries "
@@ -59,16 +85,14 @@ def query_ollama(po_text, prompt_json):
         response.raise_for_status()
         return json.loads(response.json().get('response', '{}'))
     except requests.RequestException as e:
-        print(f"Error querying Ollama: {e}")
+        log_safe_event(f"Error querying Ollama: {e}")
         raise
     except json.JSONDecodeError as e:
-        print(f"Error parsing AI response: {e}")
+        log_safe_event(f"Error parsing AI response: {e}")
         raise
 
-def update_quickbase(record_id, target_table_id, target_field_ids, ai_data):
-    """
-    Update the record in Quickbase using the dynamic field map.
-    """
+def update_quickbase(record_id: str, target_table_id: str, target_field_ids: Dict[str, int], ai_data: Dict[str, Any]):
+    """Update the record in Quickbase using the dynamic field map."""
     headers = {
         'QB-Realm-Hostname': QUICKBASE_REALM,
         'User-Agent': 'Python-Worker',
@@ -83,7 +107,7 @@ def update_quickbase(record_id, target_table_id, target_field_ids, ai_data):
         if json_key in ai_data:
             fields_to_update[str(fid)] = {"value": ai_data[json_key]}
         else:
-            print(f"WARNING: Expected key '{json_key}' not found in AI response.")
+            logger.warning(f"Expected key '{json_key}' not found in AI response.")
 
     body = {
         "to": target_table_id,
@@ -95,11 +119,11 @@ def update_quickbase(record_id, target_table_id, target_field_ids, ai_data):
         response.raise_for_status()
         return response.json()
     except requests.RequestException as e:
-        print(f"Error updating Quickbase: {e}")
-        print(f"Failed Payload Metadata: {{'to': target_table_id, 'record_id': record_id, 'error': str(e)}}")
+        log_safe_event(f"Error updating Quickbase: {e}")
+        logger.error(f"Failed Payload Metadata: {{'to': target_table_id, 'record_id': record_id, 'error': str(e)}}")
         raise
 
-def update_quickbase_error(record_id, target_table_id, error_field_id, error_message):
+def update_quickbase_error(record_id: str, target_table_id: str, error_field_id: int, error_message: str):
     headers = {
         'QB-Realm-Hostname': QUICKBASE_REALM,
         'User-Agent': 'Python-Worker',
@@ -120,26 +144,26 @@ def update_quickbase_error(record_id, target_table_id, error_field_id, error_mes
     try:
         requests.post(QUICKBASE_URL, headers=headers, json=body)
     except Exception as e:
-        print(f"Failed to report error to QuickBase: {e}")
+        logger.error(f"Failed to report error to QuickBase: {e}")
 
-def process_po_job(data):
-    start_time = time.time() # Start Timer
+def process_po_job(data: Dict[str, Any]):
+    start_time = time.time()
     record_id = data['record_id']
     request_name = data.get('request_name', 'Unknown Request')
     
-    print(f"Processing Job: '{request_name}' for Record: {record_id}")
+    log_safe_event(f"Processing Job: '{request_name}' for Record: {record_id}")
 
     # --- GUARD RAILS ---
-    if not data.get('po_text') or len(data['po_text'].strip()) < 10:
-        print("Skipped: Text empty.")
+    if not data.get('po_text') or len(data.get('po_text', '').strip()) < 10:
+        log_safe_event("Skipped: Text empty.")
         return "Skipped"
 
     try:
-        print(f"Sending to Ollama...")
+        logger.info(f"Sending to Ollama...")
         ai_result = query_ollama(data['po_text'], data['prompt_json'])
-        print(f"Ollama analysis complete. Keys found: {list(ai_result.keys())}")
+        logger.info(f"Ollama analysis complete. Keys found: {list(ai_result.keys())}")
 
-        print(f"Updating QuickBase table {data['target_table_id']}...")
+        logger.info(f"Updating QuickBase table {data['target_table_id']}...")
         update_quickbase(
             record_id,
             data['target_table_id'],
@@ -147,16 +171,16 @@ def process_po_job(data):
             ai_result
         )
         
-        end_time = time.time() # End Timer
+        end_time = time.time()
         duration = end_time - start_time
-        print(f"Job complete for {record_id}")
-        print(f"PERFORMANCE: Job finished in {duration:.2f} seconds") # Log Duration
+        log_safe_event(f"Job complete for {record_id}")
+        log_safe_event(f"PERFORMANCE: Job finished in {duration:.2f} seconds")
         return "Success"
 
     except Exception as e:
-        print(f"Job failed for {record_id}: {e}")
+        log_safe_event(f"Job failed for {record_id}: {e}")
         if 'error_field_id' in data and 'target_table_id' in data:
-            print(f"Reporting error to QuickBase field {data['error_field_id']}...")
+            logger.info(f"Reporting error to QuickBase field {data['error_field_id']}...")
             update_quickbase_error(
                 record_id,
                 data['target_table_id'],
@@ -166,17 +190,10 @@ def process_po_job(data):
         raise e
 
 if __name__ == '__main__':
-    redis_conn = Redis(
-        host=os.getenv('REDIS_HOST', 'localhost'),
-        port=int(os.getenv('REDIS_PORT', 6379)),
-        password=os.getenv('REDIS_PASSWORD', None)
-    )
-
-    # Read queues from Env Var (comma separated), default to 'default'
-    # Example: "high,default,low" or "long_docs"
+    # Read queues from Env Var, default to 'default'
     queue_names = os.getenv('WORKER_QUEUES', 'default').split(',')
     
     with Connection(redis_conn):
-        print(f"Worker listening on queues: {queue_names}")
+        logger.info(f"Worker listening on queues: {queue_names}")
         worker = Worker(map(Queue, queue_names))
         worker.work()

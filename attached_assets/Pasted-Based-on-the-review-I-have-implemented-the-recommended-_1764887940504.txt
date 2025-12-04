@@ -1,0 +1,410 @@
+Based on the review, I have implemented the recommended changes to improve security, architecture, and code quality.
+
+Here are the updated files and a new Runbook for your operations.
+
+1. Update generated_backend/app.py
+Changes Made:
+
+Security: Removed the hardcoded default API key. The app will now crash intentionally if API_KEY is not set in the environment, preventing accidental insecure deployments.
+
+Validation: Added a check to ensure target_field_ids is a dictionary/object.
+
+Documentation: Added clear comments explaining the Table ID to Queue mapping.
+
+Debug Endpoint: Added a protected /debug/config endpoint to view current routing rules.
+
+Python
+
+from flask import Flask, request, jsonify
+from redis import Redis
+from rq import Queue
+import os
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# 1. SECURITY: Enforce API Key from Environment
+API_KEY = os.getenv('API_KEY')
+if not API_KEY:
+    raise RuntimeError("CRITICAL: API_KEY environment variable must be set. Application failed to start.")
+
+# Redis connection
+redis_conn = Redis(
+    host=os.getenv('REDIS_HOST', 'localhost'),
+    port=int(os.getenv('REDIS_PORT', 6379)),
+    password=os.getenv('REDIS_PASSWORD', None)
+)
+
+# Define our Queues
+q_high = Queue('high', connection=redis_conn)
+q_default = Queue('default', connection=redis_conn)
+q_low = Queue('low', connection=redis_conn)
+q_long = Queue('long_docs', connection=redis_conn)
+
+# Configuration
+LONG_DOC_THRESHOLD = 20000  # Characters
+
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    client_key = request.headers.get('X-API-Key')
+    if client_key != API_KEY:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        # Fetch logs from Redis
+        raw_logs = redis_conn.lrange("monitor_logs", 0, 49)
+        logs = [log.decode('utf-8') for log in raw_logs]
+        
+        total_depth = len(q_high) + len(q_default) + len(q_low) + len(q_long)
+
+        return jsonify({
+            "status": "online",
+            "queue_depth": total_depth,
+            "queues": {
+                "high": len(q_high),
+                "default": len(q_default),
+                "low": len(q_low),
+                "long_docs": len(q_long)
+            },
+            "logs": logs
+        })
+    except Exception as e:
+        logger.error(f"Status check failed: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/debug/config', methods=['GET'])
+def get_routing_config():
+    """Helper endpoint to verify routing logic and thresholds."""
+    client_key = request.headers.get('X-API-Key')
+    if client_key != API_KEY:
+        return jsonify({'error': 'Unauthorized'}), 401
+        
+    return jsonify({
+        "long_doc_threshold": LONG_DOC_THRESHOLD,
+        "routing_table": {
+            "brbf729zp": "high (Priority Contracts)",
+            "bpcdfksyx": "low (Standard Invoices)",
+            "others": "default"
+        }
+    })
+
+@app.route('/api/process_po', methods=['POST'])
+def process_po():
+    client_key = request.headers.get('X-API-Key')
+    if client_key != API_KEY:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        data = request.get_json()
+        
+        # Validation
+        required_fields = ['record_id', 'po_text', 'target_table_id', 'target_field_ids', 'prompt_json']
+        missing = [field for field in required_fields if field not in data]
+        
+        if missing:
+            return jsonify({'error': f'Missing required fields: {", ".join(missing)}'}), 400
+
+        if not isinstance(data.get('target_field_ids'), dict):
+             return jsonify({'error': 'target_field_ids must be a JSON object mapping keys to FIDs'}), 400
+
+        # --- ROUTING LOGIC ---
+        table_id = data.get('target_table_id', '')
+        text_len = len(data.get('po_text', '') or "")
+        
+        selected_queue = q_default
+        queue_name = "default"
+
+        # 1. HEAVY TRAFFIC: Check Length First
+        if text_len > LONG_DOC_THRESHOLD:
+            selected_queue = q_long
+            queue_name = "long_docs"
+        
+        # 2. FAST TRAFFIC: Check Table Priority
+        else:
+            # Table: brbf729zp -> High Priority (e.g. Urgent Contracts)
+            if table_id == 'brbf729zp':
+                selected_queue = q_high
+                queue_name = "high"
+            # Table: bpcdfksyx -> Low Priority (e.g. Batch Invoices)
+            elif table_id == 'bpcdfksyx':
+                selected_queue = q_low
+                queue_name = "low"
+            # All other tables -> Default Priority
+            else:
+                selected_queue = q_default
+                queue_name = "default"
+
+        # Enqueue
+        from worker import process_po_job
+        job = selected_queue.enqueue(
+            process_po_job,
+            args=(data,),
+            job_timeout='30m'
+        )
+        
+        logger.info(f"Enqueued record {data['record_id']} to {queue_name}")
+        
+        return jsonify({
+            'status': 'queued',
+            'queue': queue_name,
+            'job_id': job.get_id(),
+            'message': f'Record {data["record_id"]} added to {queue_name} queue'
+        }), 202
+        
+    except Exception as e:
+        logger.error(f"API Error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+2. Update generated_backend/worker.py
+Changes Made:
+
+Logging: Switched from print() to Python's standard logging module. This allows for better filtering and timestamping in system logs.
+
+Type Hints: Added type definitions to main functions to make the code self-documenting and safer.
+
+Python
+
+import os
+import requests
+import json
+import time
+import logging
+from typing import Dict, Any, Union
+from redis import Redis
+from rq import Worker, Queue, Connection
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434/api/generate')
+QUICKBASE_URL = os.getenv('QUICKBASE_URL', 'https://api.quickbase.com/v1/records')
+QUICKBASE_USER_TOKEN = os.getenv('QUICKBASE_USER_TOKEN')
+QUICKBASE_REALM = os.getenv('QUICKBASE_REALM', 'your-realm.quickbase.com')
+
+# Redis Connection (Global)
+redis_conn = Redis(
+    host=os.getenv('REDIS_HOST', 'localhost'),
+    port=int(os.getenv('REDIS_PORT', 6379)),
+    password=os.getenv('REDIS_PASSWORD', None)
+)
+
+def log_safe_event(message: str):
+    """Logs a message to stdout (for systemd) AND pushes it to Redis (for Dashboard)."""
+    logger.info(message)
+    timestamp = time.strftime("%H:%M:%S")
+    log_entry = f"[{timestamp}] {message}"
+    try:
+        # Push to 'monitor_logs' list and keep only last 100
+        redis_conn.lpush("monitor_logs", log_entry)
+        redis_conn.ltrim("monitor_logs", 0, 99) 
+    except Exception as e:
+        logger.warning(f"Could not push log to Redis: {e}")
+
+def query_ollama(po_text: str, prompt_json: Dict[str, str]) -> Dict[str, Any]:
+    """Send text + schema to Ollama."""
+    system_instruction = (
+        "You are an expert legal contract analyst. "
+        "Your job is to read the ENTIRE document provided and generate accurate, comprehensive summaries "
+        "for the specific topics requested in the JSON schema. "
+        "Do not skip sections. Synthesize information from multiple pages if necessary. "
+        "If a topic is not present, explicitly state that it is not addressed. "
+        "Output ONLY valid JSON."
+    )
+
+    full_prompt = f"""
+{system_instruction}
+
+--- BEGIN DOCUMENT TEXT ---
+{po_text}
+--- END DOCUMENT TEXT ---
+
+**INSTRUCTIONS:**
+1. Read the document text above.
+2. For each key in the schema below, analyze the text and provide the requested summary.
+3. Return ONLY the JSON object.
+
+**REQUIRED OUTPUT SCHEMA:**
+{json.dumps(prompt_json, indent=2)}
+"""
+
+    payload = {
+        "model": "llama3.1",
+        "format": "json",
+        "prompt": full_prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.0,
+            "num_predict": 4096,
+            "top_k": 20,
+            "num_ctx": 32000,
+            "repeat_penalty": 1.1
+        }
+    }
+
+    try:
+        response = requests.post(OLLAMA_URL, json=payload, timeout=1800)
+        response.raise_for_status()
+        return json.loads(response.json().get('response', '{}'))
+    except requests.RequestException as e:
+        log_safe_event(f"Error querying Ollama: {e}")
+        raise
+    except json.JSONDecodeError as e:
+        log_safe_event(f"Error parsing AI response: {e}")
+        raise
+
+def update_quickbase(record_id: str, target_table_id: str, target_field_ids: Dict[str, int], ai_data: Dict[str, Any]):
+    """Update the record in Quickbase using the dynamic field map."""
+    headers = {
+        'QB-Realm-Hostname': QUICKBASE_REALM,
+        'User-Agent': 'Python-Worker',
+        'Authorization': f'QB-USER-TOKEN {QUICKBASE_USER_TOKEN}',
+        'Content-Type': 'application/json'
+    }
+
+    fields_to_update = {}
+    fields_to_update["3"] = {"value": record_id}
+
+    for json_key, fid in target_field_ids.items():
+        if json_key in ai_data:
+            fields_to_update[str(fid)] = {"value": ai_data[json_key]}
+        else:
+            logger.warning(f"Expected key '{json_key}' not found in AI response.")
+
+    body = {
+        "to": target_table_id,
+        "data": [fields_to_update]
+    }
+
+    try:
+        response = requests.post(QUICKBASE_URL, headers=headers, json=body)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        log_safe_event(f"Error updating Quickbase: {e}")
+        logger.error(f"Failed Payload Metadata: {{'to': target_table_id, 'record_id': record_id, 'error': str(e)}}")
+        raise
+
+def update_quickbase_error(record_id: str, target_table_id: str, error_field_id: int, error_message: str):
+    headers = {
+        'QB-Realm-Hostname': QUICKBASE_REALM,
+        'User-Agent': 'Python-Worker',
+        'Authorization': f'QB-USER-TOKEN {QUICKBASE_USER_TOKEN}',
+        'Content-Type': 'application/json'
+    }
+
+    body = {
+        "to": target_table_id,
+        "data": [
+            {
+                "3": {"value": record_id},
+                str(error_field_id): {"value": str(error_message)}
+            }
+        ]
+    }
+
+    try:
+        requests.post(QUICKBASE_URL, headers=headers, json=body)
+    except Exception as e:
+        logger.error(f"Failed to report error to QuickBase: {e}")
+
+def process_po_job(data: Dict[str, Any]):
+    start_time = time.time()
+    record_id = data['record_id']
+    request_name = data.get('request_name', 'Unknown Request')
+    
+    log_safe_event(f"Processing Job: '{request_name}' for Record: {record_id}")
+
+    # --- GUARD RAILS ---
+    if not data.get('po_text') or len(data.get('po_text', '').strip()) < 10:
+        log_safe_event("Skipped: Text empty.")
+        return "Skipped"
+
+    try:
+        logger.info(f"Sending to Ollama...")
+        ai_result = query_ollama(data['po_text'], data['prompt_json'])
+        logger.info(f"Ollama analysis complete. Keys found: {list(ai_result.keys())}")
+
+        logger.info(f"Updating QuickBase table {data['target_table_id']}...")
+        update_quickbase(
+            record_id,
+            data['target_table_id'],
+            data['target_field_ids'],
+            ai_result
+        )
+        
+        end_time = time.time()
+        duration = end_time - start_time
+        log_safe_event(f"Job complete for {record_id}")
+        log_safe_event(f"PERFORMANCE: Job finished in {duration:.2f} seconds")
+        return "Success"
+
+    except Exception as e:
+        log_safe_event(f"Job failed for {record_id}: {e}")
+        if 'error_field_id' in data and 'target_table_id' in data:
+            logger.info(f"Reporting error to QuickBase field {data['error_field_id']}...")
+            update_quickbase_error(
+                record_id,
+                data['target_table_id'],
+                data['error_field_id'],
+                str(e)
+            )
+        raise e
+
+if __name__ == '__main__':
+    # Read queues from Env Var, default to 'default'
+    queue_names = os.getenv('WORKER_QUEUES', 'default').split(',')
+    
+    with Connection(redis_conn):
+        logger.info(f"Worker listening on queues: {queue_names}")
+        worker = Worker(map(Queue, queue_names))
+        worker.work()
+3. Create a Runbook (generated_backend/RUNBOOK.md)
+This file helps you (or anyone else) manage the server. Add this file to your repo.
+
+Markdown
+
+# Operational Runbook: Azure AI Processor
+
+## 1. Deployment
+All code changes should be pushed to the `main` branch on GitHub. This triggers the automated pipeline.
+- **Check Status:** [GitHub Actions Tab](https://github.com/American-Power-Systems/OllamaQuickBase/actions)
+
+## 2. API Keys & Secrets
+Sensitive values are stored in **Azure Environment Variables** (via systemd service files) or **User Environment** (`~/.env_report`).
+
+- **Rotate API Key:**
+  1. SSH into server.
+  2. Edit `/etc/systemd/system/ai-api.service`.
+  3. Update `Environment="API_KEY=new_key_here"`.
+  4. Run `sudo systemctl daemon-reload && sudo systemctl restart ai-api`.
+
+- **Update Email Credentials:**
+  1. Edit `~/.env_report`.
+  2. Update values.
+
+## 3. Service Management
+If the API or Workers seem stuck, restart them manually.
+
+```bash
+# Restart API
+sudo systemctl restart ai-api
+
+# Restart Standard Worker (High/Default/Low)
+sudo systemctl restart ai-worker
+
+# Restart Heavy Worker (Long Docs)
+sudo systemctl restart ai-worker-heavy
+
+# Restart Nginx (Web Server/SSL)
+sudo systemctl restart nginx
