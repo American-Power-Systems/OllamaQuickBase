@@ -172,6 +172,11 @@ if __name__ == '__main__':
         password=os.getenv('REDIS_PASSWORD', None)
     )
 
+    # Read queues from Env Var (comma separated), default to 'default'
+    # Example: "high,default,low" or "long_docs"
+    queue_names = os.getenv('WORKER_QUEUES', 'default').split(',')
+    
     with Connection(redis_conn):
-        worker = Worker(map(Queue, ['default']))
+        print(f"Worker listening on queues: {queue_names}")
+        worker = Worker(map(Queue, queue_names))
         worker.work()

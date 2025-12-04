@@ -1,3 +1,18 @@
+Yes, you can absolutely achieve both goals using Redis Queue (RQ). To do this, we need to make your "Router" (app.py) smarter so it decides which queue to send a job to, and then configure your two workers to listen to specific queues.
+
+Here is the strategy:
+
+The "Long Doc" Worker: Listens to a long_docs queue.
+
+The "Fast" Worker: Listens to high, default, and low queues (in that order of priority).
+
+The Router (app.py): Checks the text length first. If it's huge, it goes to long_docs. If not, it checks the Table ID to assign priority.
+
+Step 1: Update generated_backend/app.py
+We need to instantiate multiple queues and add the logic to route traffic.
+
+Python
+
 from flask import Flask, request, jsonify
 from redis import Redis
 from rq import Queue
@@ -82,3 +97,25 @@ def process_po():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+Step 2: Update generated_backend/worker.py
+We need to update the worker so it doesn't just listen to ['default'] anymore. Instead, it should read an environment variable to know which queues it is responsible for.
+
+Change the bottom if __name__ == '__main__': block to this:
+
+Python
+
+if __name__ == '__main__':
+    redis_conn = Redis(
+        host=os.getenv('REDIS_HOST', 'localhost'),
+        port=int(os.getenv('REDIS_PORT', 6379)),
+        password=os.getenv('REDIS_PASSWORD', None)
+    )
+
+    # Read queues from Env Var (comma separated), default to 'default'
+    # Example: "high,default,low" or "long_docs"
+    queue_names = os.getenv('WORKER_QUEUES', 'default').split(',')
+    
+    with Connection(redis_conn):
+        print(f"Worker listening on queues: {queue_names}")
+        worker = Worker(map(Queue, queue_names))
+        worker.work()
