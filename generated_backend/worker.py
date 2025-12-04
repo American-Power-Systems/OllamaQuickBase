@@ -12,14 +12,17 @@ QUICKBASE_REALM = os.getenv('QUICKBASE_REALM', 'your-realm.quickbase.com')
 
 def query_ollama(po_text, prompt_json):
     """
-    Send text + schema to Ollama with HIGH FOCUS settings.
+    Send text + schema to Ollama with settings tuned for SUMMARIZATION.
     """
+    # CHANGE 1: Updated Persona.
+    # We tell it to be an "Analyst" rather than an "Extractor" so it synthesizes info better.
     system_instruction = (
-        "You are a strict document extraction engine. "
-        "Your ONLY job is to extract the specific terms requested in the JSON schema. "
-        "Ignore all conversational filler, pleasantries, and unrelated document text. "
-        "If a specific topic (like Insurance or Payment Terms) is not found, return null for that field. "
-        "Do not explain your answer. Output ONLY valid JSON."
+        "You are an expert legal contract analyst. "
+        "Your job is to read the ENTIRE document provided and generate accurate, comprehensive summaries "
+        "for the specific topics requested in the JSON schema. "
+        "Do not skip sections. Synthesize information from multiple pages if necessary. "
+        "If a topic is not present, explicitly state that it is not addressed. "
+        "Output ONLY valid JSON."
     )
 
     full_prompt = f"""
@@ -30,24 +33,25 @@ def query_ollama(po_text, prompt_json):
 --- END DOCUMENT TEXT ---
 
 **INSTRUCTIONS:**
-Review the document above.
-Extract the exact information requested by the keys below.
-Return ONLY the JSON object.
+1. Read the document text above.
+2. For each key in the schema below, analyze the text and provide the requested summary.
+3. Return ONLY the JSON object.
 
 **REQUIRED OUTPUT SCHEMA:**
 {json.dumps(prompt_json, indent=2)}
 """
 
     payload = {
-        "model": "llama3.1",  # <--- UPDATED HERE
+        "model": "llama3.1",
         "format": "json",
         "prompt": full_prompt,
         "stream": False,
         "options": {
-            "temperature": 0.0,
-            "num_predict": 1024,
+            "temperature": 0.0,      # Keep 0 for valid JSON, but...
+            "num_predict": 4096,     # CHANGE 2: Increased from 1024. Gives AI room to write long summaries.
             "top_k": 20,
-            "num_ctx": 32000  # Increased to 32k safely with llama3.1
+            "num_ctx": 32000,        # Kept high context from previous step
+            "repeat_penalty": 1.1    # CHANGE 3: Prevents repetitive text in long summaries
         }
     }
 

@@ -1,0 +1,57 @@
+To ensure the LLM generates high-quality summaries without cutting off (losing quality) or skipping sections (not reading all text), you can make specific adjustments to the System Prompt and the Model Parameters in your worker.py.Since you are asking it to "summarize" rather than just "extract a date," the default settings might be too restrictive or the output limit too short.Here are the recommended changes for generated_backend/worker.py.1. Update system_instructionWhy: The previous prompt told the AI it was a "strict extraction engine" and to "ignore filler." For summaries, "filler" (context) is important. We will re-frame it as an "Expert Legal Analyst" to encourage more thoughtful, comprehensive synthesis of the text.2. Increase num_predict (Output Length)Why: It was set to 1024. If you ask for summaries of 6 different topics, the AI might hit this limit and cut off the JSON in the middle, breaking your pipeline. Increasing this ensures it has "space" to write the full summary.3. Add repeat_penaltyWhy: Long context models sometimes get stuck in loops. A slight penalty prevents it from repeating the same phrase in a summary.Updated Code for generated_backend/worker.pyReplace your query_ollama function (and the payload dictionary inside it) with this updated version:Pythondef query_ollama(po_text, prompt_json):
+    """
+    Send text + schema to Ollama with settings tuned for SUMMARIZATION.
+    """
+    # CHANGE 1: Updated Persona.
+    # We tell it to be an "Analyst" rather than an "Extractor" so it synthesizes info better.
+    system_instruction = (
+        "You are an expert legal contract analyst. "
+        "Your job is to read the ENTIRE document provided and generate accurate, comprehensive summaries "
+        "for the specific topics requested in the JSON schema. "
+        "Do not skip sections. Synthesize information from multiple pages if necessary. "
+        "If a topic is not present, explicitly state that it is not addressed. "
+        "Output ONLY valid JSON."
+    )
+
+    full_prompt = f"""
+{system_instruction}
+
+--- BEGIN DOCUMENT TEXT ---
+{po_text}
+--- END DOCUMENT TEXT ---
+
+**INSTRUCTIONS:**
+1. Read the document text above.
+2. For each key in the schema below, analyze the text and provide the requested summary.
+3. Return ONLY the JSON object.
+
+**REQUIRED OUTPUT SCHEMA:**
+{json.dumps(prompt_json, indent=2)}
+"""
+
+    payload = {
+        "model": "llama3.1",
+        "format": "json",
+        "prompt": full_prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.0,      # Keep 0 for valid JSON, but...
+            "num_predict": 4096,     # CHANGE 2: Increased from 1024. Gives AI room to write long summaries.
+            "top_k": 20,
+            "num_ctx": 32000,        # Kept high context from previous step
+            "repeat_penalty": 1.1    # CHANGE 3: Prevents repetitive text in long summaries
+        }
+    }
+
+    try:
+        # Increased timeout to 30 minutes for large files
+        response = requests.post(OLLAMA_URL, json=payload, timeout=1800)
+        response.raise_for_status()
+        return json.loads(response.json().get('response', '{}'))
+    except requests.RequestException as e:
+        print(f"Error querying Ollama: {e}")
+        raise
+    except json.JSONDecodeError as e:
+        print(f"Error parsing AI response: {e}")
+        raise
+Summary of ChangesSettingOld ValueNew ValueEffectSystem Persona"Extraction Engine""Expert Legal Analyst"Encourages synthesis and reading comprehension over simple keyword matching.num_predict10244096Prevents the JSON response from being cut off if the summary is detailed.repeat_penalty(Not set)1.1Prevents the AI from saying "The contract says... The contract says..." repeatedly.
