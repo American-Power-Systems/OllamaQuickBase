@@ -61,7 +61,14 @@ This application is deployed on a standard Azure Virtual Machine (Ubuntu 22.04 L
     *   Logs are managed via systemd (services: `ai-api` and `ai-worker`).
     *   To update the extraction logic (e.g., asking "Where are the insurance requirements?" instead of "What are they?"), **do not edit this code**. Simply update the JSON Prompt stored in your QuickBase "Prompt Library". The app will automatically process the new question.
 
-## 5. Deployment
+## 5. Security
+
+**CRITICAL:** This application requires an `API_KEY` environment variable to function.
+*   **Do NOT** hardcode secrets in the source code.
+*   **Do NOT** commit `.env` files to GitHub.
+*   Ensure `API_KEY` is set in your Azure deployment (e.g., via systemd service files or Azure App Service configuration).
+
+## 6. Deployment
 
 Deployments are automated via GitHub Actions.
 **Important:** This repository contains both a frontend (client) and backend (generated_backend). For the Azure AI Processor, we only deploy the contents of `generated_backend`.
