@@ -1,0 +1,44 @@
+name: Deploy to Azure
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Allows manual triggering from GitHub UI
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.AZURE_HOST }}
+          username: ${{ secrets.AZURE_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Exit immediately if a command exits with a non-zero status
+            set -e
+            
+            echo "🚀 Starting Deployment for OllamaQuickBase..."
+            
+            # 1. Navigate to the project folder on Azure
+            # Ensure this folder exists and is a git repo (see Phase 1 of previous instructions)
+            cd ~/ai-processor
+            
+            # 2. Pull the latest code
+            git fetch origin main
+            git reset --hard origin/main
+            
+            # 3. Install/Update Dependencies
+            # Pointing specifically to the generated_backend folder
+            echo "📦 Installing dependencies..."
+            pip install -r generated_backend/requirements.txt
+            
+            # 4. Restart Services
+            # These match the service names mentioned in your README
+            echo "Mw Restarting AI Services..."
+            sudo systemctl restart ai-api
+            sudo systemctl restart ai-worker
+            
+            echo "✅ Deployment Successful!"
