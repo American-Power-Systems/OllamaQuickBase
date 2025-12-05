@@ -1,3 +1,14 @@
+Based on the files you uploaded, NO, the dashboard will not show worker activity yet because your app.py is missing the status endpoint.
+
+The generated_backend/app.py file in your latest upload only contains the process_po logic. It is missing the /api/status endpoint that the dashboard tries to call. Without this, your dashboard will likely show "Offline" or empty data (error 404).
+
+To fix this and see the "Busy/Idle" status of your workers, you must update generated_backend/app.py to include the status logic.
+
+Step 1: Update generated_backend/app.py
+Replace the entire content of your app.py with this code. It combines your Smart Routing with the Worker Monitoring logic.
+
+Python
+
 from flask import Flask, request, jsonify
 from redis import Redis
 from rq import Queue, Worker
@@ -134,3 +145,19 @@ def process_po():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+Step 2: Deploy & Verify
+Push this code to GitHub.
+
+Wait for the deployment to finish.
+
+Refresh your dashboard.
+
+Once deployed:
+
+You will see a new table "Worker Fleet".
+
+It will list 2 workers.
+
+When you submit a request, the State will change from IDLE to BUSY.
+
+The Current Job column will show the Record ID being processed.
