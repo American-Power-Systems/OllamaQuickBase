@@ -42,11 +42,9 @@ def log_safe_event(message: str):
 def query_ollama(po_text: str, prompt_json: Dict[str, str]) -> Dict[str, Any]:
     """Send text + schema to Ollama."""
     system_instruction = (
-        "You are an expert legal contract analyst. "
-        "Your job is to read the ENTIRE document provided and generate accurate, comprehensive summaries "
-        "for the specific topics requested in the JSON schema. "
-        "Do not skip sections. Synthesize information from multiple pages if necessary. "
-        "If a topic is not present, explicitly state that it is not addressed. "
+        "You are an expert data extraction engine. "
+        "Your job is to read the document provided and extract accurate information "
+        "matching the specific keys requested in the JSON schema. "
         "Output ONLY valid JSON."
     )
 
