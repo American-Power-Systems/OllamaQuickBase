@@ -122,7 +122,6 @@ def update_quickbase(record_id: str, target_table_id: str, target_field_ids: Dic
         if json_key in ai_data:
             fields_to_update[str(fid)] = {"value": ai_data[json_key]}
         else:
-            # IMPROVEMENT: Don't just warn, check if we have a partial result or error message
             logger.warning(f"Key '{json_key}' missing from AI response.")
 
     if len(fields_to_update) <= 1:
@@ -200,7 +199,6 @@ def process_po_job(data: Dict[str, Any]):
             any_success = True
         except Exception as e:
             log_safe_event(f"Extraction failed: {e}")
-            # We continue to try summarization even if extraction failed
 
     # 3. Run Summarization (Isolated) - LOWER IMPORTANCE / HIGHER RISK
     if summary_keys:
@@ -214,7 +212,6 @@ def process_po_job(data: Dict[str, Any]):
             any_success = True
         except Exception as e:
             log_safe_event(f"Summarization failed: {e}")
-            # Add error message to the summary field so user knows it failed
             for k in summary_keys:
                 final_results[k] = f"Error: {str(e)[:100]}..."
 

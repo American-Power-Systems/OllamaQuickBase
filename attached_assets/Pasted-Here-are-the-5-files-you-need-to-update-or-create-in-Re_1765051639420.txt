@@ -1,0 +1,698 @@
+Here are the 5 files you need to update (or create) in Replit to match your live server.
+
+Copy and paste these exact blocks into the corresponding files in your Replit project.
+
+1. generated_backend/requirements.txt
+Adds the monitoring library.
+
+Plaintext
+
+flask==3.0.2
+redis==5.0.1
+rq==1.16.0
+requests==2.31.0
+gunicorn==21.2.0
+psutil==5.9.8
+2. generated_backend/app.py
+Includes the new Status API and Smart Routing logic.
+
+Python
+
+from flask import Flask, request, jsonify
+from redis import Redis
+from rq import Queue, Worker
+import os
+import logging
+import psutil
+import subprocess
+import shutil
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# SECURITY
+API_KEY = os.getenv('API_KEY')
+
+# Redis Connection
+redis_conn = Redis(
+    host=os.getenv('REDIS_HOST', 'localhost'),
+    port=int(os.getenv('REDIS_PORT', 6379)),
+    password=os.getenv('REDIS_PASSWORD', None)
+)
+
+# Queues
+q_high = Queue('high', connection=redis_conn)
+q_default = Queue('default', connection=redis_conn)
+q_low = Queue('low', connection=redis_conn)
+q_long = Queue('long_docs', connection=redis_conn)
+
+def get_gpu_stats():
+    """Parses nvidia-smi for GPU usage."""
+    if not shutil.which('nvidia-smi'):
+        return {"load": 0, "memory": 0, "mem_used_mb": 0}
+    try:
+        # Get GPU Load and Memory Used
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"],
+            encoding='utf-8'
+        )
+        util, mem_used, mem_total = map(int, output.strip().split(', '))
+        mem_percent = round((mem_used / mem_total) * 100, 1)
+        return {"load": util, "memory": mem_percent, "mem_used_mb": mem_used}
+    except Exception:
+        return {"load": 0, "memory": 0, "mem_used_mb": 0}
+
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    client_key = request.headers.get('X-API-Key')
+    if client_key != API_KEY:
+        # Strict security: Require key even for dashboard
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        # 1. Redis Logs
+        raw_logs = redis_conn.lrange("monitor_logs", 0, 19)
+        logs = [log.decode('utf-8') for log in raw_logs]
+
+        # 2. Queue Depths
+        queues = {
+            "high": len(q_high),
+            "default": len(q_default),
+            "low": len(q_low),
+            "long_docs": len(q_long)
+        }
+        total_depth = sum(queues.values())
+
+        # 3. Worker Status
+        workers = Worker.all(connection=redis_conn)
+        active_count = sum(1 for w in workers if w.state == 'busy')
+        
+        # 4. System Resources
+        sys_stats = {
+            "cpu": psutil.cpu_percent(interval=None),
+            "ram": psutil.virtual_memory().percent,
+            "gpu": get_gpu_stats()
+        }
+
+        return jsonify({
+            "status": "online" if active_count > 0 else "idle",
+            "queue_depth": total_depth,
+            "active_workers": len(workers),
+            "working_count": active_count,
+            "queues": queues,
+            "system": sys_stats,
+            "logs": logs
+        })
+    except Exception as e:
+        logger.error(f"Status Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/process_po', methods=['POST'])
+def process_po():
+    client_key = request.headers.get('X-API-Key')
+    if client_key != API_KEY:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        data = request.get_json()
+        
+        required_fields = ['record_id', 'po_text', 'target_table_id', 'target_field_ids', 'prompt_json']
+        if any(f not in data for f in required_fields):
+            return jsonify({'error': 'Missing fields'}), 400
+
+        # Routing Logic
+        priority = data.get('priority', 'normal').lower()
+        text_len = len(data.get('po_text', '') or "")
+        LONG_DOC_THRESHOLD = 20000
+        
+        selected_queue = q_default
+        queue_name = "default"
+
+        if text_len > LONG_DOC_THRESHOLD:
+            selected_queue = q_long
+            queue_name = "long_docs"
+        elif priority == 'high':
+            selected_queue = q_high
+            queue_name = "high"
+        elif priority == 'low':
+            selected_queue = q_low
+            queue_name = "low"
+        else:
+            selected_queue = q_default
+            queue_name = "default"
+
+        from worker import process_po_job
+        job = selected_queue.enqueue(
+            process_po_job,
+            args=(data,),
+            job_timeout='60m'
+        )
+        
+        logger.info(f"Enqueued record {data['record_id']} to {queue_name}")
+        
+        return jsonify({
+            'status': 'queued',
+            'queue': queue_name,
+            'job_id': job.get_id(),
+            'message': f'Record {data["record_id"]} added to {queue_name} queue'
+        }), 202
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+3. generated_backend/worker.py
+Includes the logging to Redis and the Split Extraction logic.
+
+Python
+
+import os
+import requests
+import json
+import time
+import logging
+from typing import Dict, Any, Union
+from redis import Redis
+from rq import Worker, Queue, Connection
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+OLLAMA_URL = os.getenv('OLLAMA_URL', 'http://localhost:11434/api/generate')
+QUICKBASE_URL = os.getenv('QUICKBASE_URL', 'https://api.quickbase.com/v1/records')
+QUICKBASE_USER_TOKEN = os.getenv('QUICKBASE_USER_TOKEN')
+QUICKBASE_REALM = os.getenv('QUICKBASE_REALM', 'your-realm.quickbase.com')
+
+# Redis Connection (Global)
+redis_conn = Redis(
+    host=os.getenv('REDIS_HOST', 'localhost'),
+    port=int(os.getenv('REDIS_PORT', 6379)),
+    password=os.getenv('REDIS_PASSWORD', None)
+)
+
+def log_safe_event(message: str):
+    """Logs a message to stdout (for systemd) AND pushes it to Redis (for Dashboard)."""
+    logger.info(message)
+    timestamp = time.strftime("%H:%M:%S")
+    log_entry = f"[{timestamp}] {message}"
+    try:
+        # Push to 'monitor_logs' list and keep only last 100
+        redis_conn.lpush("monitor_logs", log_entry)
+        redis_conn.ltrim("monitor_logs", 0, 99) 
+    except Exception as e:
+        logger.warning(f"Could not push log to Redis: {e}")
+
+def query_ollama(po_text: str, prompt_json: Dict[str, str], is_summary: bool = False) -> Dict[str, Any]:
+    """
+    Send text + schema to Ollama.
+    IMPROVEMENT: Added 'is_summary' flag to adjust settings dynamically.
+    """
+    if is_summary:
+        system_instruction = (
+            "You are an expert legal analyst. Summarize the document sections as requested. "
+            "Use <br> tags for line breaks. Do not use newlines inside values. "
+            "Output ONLY valid JSON."
+        )
+        # Summaries need more "creativity" and length
+        options = {
+            "temperature": 0.1, 
+            "num_predict": 4096, 
+            "top_k": 40, 
+            "num_ctx": 32000,
+            "repeat_penalty": 1.1
+        }
+    else:
+        system_instruction = (
+            "You are a strict data extraction engine. Extract specific terms exactly as they appear. "
+            "Output ONLY valid JSON."
+        )
+        # Data extraction needs to be deterministic (0 temperature)
+        options = {
+            "temperature": 0.0, 
+            "num_predict": 1024, 
+            "top_k": 20, 
+            "num_ctx": 32000
+        }
+
+    full_prompt = f"""
+{system_instruction}
+
+--- BEGIN DOCUMENT TEXT ---
+{po_text}
+--- END DOCUMENT TEXT ---
+
+**INSTRUCTIONS:**
+1. Read the document text above.
+2. For each key in the schema below, provide the requested information.
+3. Return ONLY the JSON object.
+
+**REQUIRED OUTPUT SCHEMA:**
+{json.dumps(prompt_json, indent=2)}
+"""
+
+    payload = {
+        "model": "llama3.1",
+        "format": "json",
+        "prompt": full_prompt,
+        "stream": False,
+        "options": options
+    }
+
+    try:
+        response = requests.post(OLLAMA_URL, json=payload, timeout=1800)
+        response.raise_for_status()
+        return json.loads(response.json().get('response', '{}'))
+    except requests.RequestException as e:
+        log_safe_event(f"Error querying Ollama: {e}")
+        raise
+    except json.JSONDecodeError as e:
+        log_safe_event(f"Error parsing AI response: {e}")
+        raise
+
+def update_quickbase(record_id: str, target_table_id: str, target_field_ids: Dict[str, int], ai_data: Dict[str, Any]):
+    """Update the record in Quickbase using the dynamic field map."""
+    headers = {
+        'QB-Realm-Hostname': QUICKBASE_REALM,
+        'User-Agent': 'Python-Worker',
+        'Authorization': f'QB-USER-TOKEN {QUICKBASE_USER_TOKEN}',
+        'Content-Type': 'application/json'
+    }
+
+    fields_to_update = {}
+    fields_to_update["3"] = {"value": record_id}
+
+    for json_key, fid in target_field_ids.items():
+        if json_key in ai_data:
+            fields_to_update[str(fid)] = {"value": ai_data[json_key]}
+        else:
+            logger.warning(f"Key '{json_key}' missing from AI response.")
+
+    if len(fields_to_update) <= 1:
+        logger.warning("No new data fields to update.")
+        return {}
+
+    body = {
+        "to": target_table_id,
+        "data": [fields_to_update]
+    }
+
+    try:
+        response = requests.post(QUICKBASE_URL, headers=headers, json=body)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        log_safe_event(f"Error updating Quickbase: {e}")
+        logger.error(f"Failed Payload Metadata: {{'to': target_table_id, 'record_id': record_id, 'error': str(e)}}")
+        raise
+
+def update_quickbase_error(record_id: str, target_table_id: str, error_field_id: int, error_message: str):
+    headers = {
+        'QB-Realm-Hostname': QUICKBASE_REALM,
+        'User-Agent': 'Python-Worker',
+        'Authorization': f'QB-USER-TOKEN {QUICKBASE_USER_TOKEN}',
+        'Content-Type': 'application/json'
+    }
+
+    body = {
+        "to": target_table_id,
+        "data": [
+            {
+                "3": {"value": record_id},
+                str(error_field_id): {"value": str(error_message)}
+            }
+        ]
+    }
+
+    try:
+        requests.post(QUICKBASE_URL, headers=headers, json=body)
+    except Exception as e:
+        logger.error(f"Failed to report error to QuickBase: {e}")
+
+def process_po_job(data: Dict[str, Any]):
+    start_time = time.time()
+    record_id = data['record_id']
+    request_name = data.get('request_name', 'Unknown Request')
+    
+    log_safe_event(f"Processing Job: '{request_name}' for Record: {record_id}")
+
+    # --- GUARD RAILS ---
+    if not data.get('po_text') or len(data.get('po_text', '').strip()) < 10:
+        log_safe_event("Skipped: Text empty.")
+        return "Skipped"
+
+    # --- IMPROVED SPLIT LOGIC ---
+    full_prompt_map = data.get('prompt_json', {})
+    
+    # 1. Identify keys based on name "summary" or "description"
+    summary_keys = [k for k in full_prompt_map.keys() if 'summary' in k.lower() or 'description' in k.lower()]
+    extraction_keys = [k for k in full_prompt_map.keys() if k not in summary_keys]
+
+    final_results = {}
+    any_success = False
+
+    # 2. Run Strict Extraction (Dates, Amounts) - HIGH IMPORTANCE
+    if extraction_keys:
+        try:
+            logger.info(f"Extracting Data fields: {extraction_keys}")
+            extraction_prompt = {k: full_prompt_map[k] for k in extraction_keys}
+            
+            # Call with is_summary=False for strict settings
+            res = query_ollama(data['po_text'], extraction_prompt, is_summary=False)
+            final_results.update(res)
+            any_success = True
+        except Exception as e:
+            log_safe_event(f"Extraction failed: {e}")
+
+    # 3. Run Summarization (Isolated) - LOWER IMPORTANCE / HIGHER RISK
+    if summary_keys:
+        try:
+            logger.info(f"Generating Summary fields: {summary_keys}")
+            summary_prompt = {k: full_prompt_map[k] for k in summary_keys}
+            
+            # Call with is_summary=True for creative settings
+            res = query_ollama(data['po_text'], summary_prompt, is_summary=True)
+            final_results.update(res)
+            any_success = True
+        except Exception as e:
+            log_safe_event(f"Summarization failed: {e}")
+            for k in summary_keys:
+                final_results[k] = f"Error: {str(e)[:100]}..."
+
+    # 4. Update QuickBase with aggregated results
+    try:
+        if not any_success:
+            raise Exception("Both Extraction and Summarization steps failed.")
+
+        logger.info(f"Updating QuickBase table {data['target_table_id']}...")
+        update_quickbase(
+            record_id,
+            data['target_table_id'],
+            data['target_field_ids'],
+            final_results
+        )
+        
+        end_time = time.time()
+        duration = end_time - start_time
+        log_safe_event(f"Job complete for {record_id}")
+        log_safe_event(f"PERFORMANCE: Job finished in {duration:.2f} seconds")
+        return "Success"
+
+    except Exception as e:
+        log_safe_event(f"Job failed for {record_id}: {e}")
+        if 'error_field_id' in data and 'target_table_id' in data:
+            logger.info(f"Reporting error to QuickBase field {data['error_field_id']}...")
+            update_quickbase_error(
+                record_id,
+                data['target_table_id'],
+                data['error_field_id'],
+                str(e)
+            )
+        raise e
+
+if __name__ == '__main__':
+    # Read queues from Env Var, default to 'default'
+    queue_names = os.getenv('WORKER_QUEUES', 'default').split(',')
+    
+    with Connection(redis_conn):
+        logger.info(f"Worker listening on queues: {queue_names}")
+        worker = Worker(map(Queue, queue_names))
+        worker.work()
+4. client/src/pages/dashboard.tsx
+Points the frontend to your Azure server.
+
+TypeScript
+
+import { useEffect, useState } from "react";
+import Layout from "@/components/layout";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Activity, Server, Zap } from "lucide-react";
+
+export default function Dashboard() {
+  const [data, setData] = useState<any>(null);
+  const [error, setError] = useState("");
+
+  // Poll API every 1 second
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const res = await fetch("https://americanpower-ai2.westus2.cloudapp.azure.com/api/status", {
+          headers: { "X-API-Key": "q#*3VyUK6&ih63xZ" }
+        });
+        if (res.ok) {
+          setData(await res.json());
+          setError("");
+        } else {
+          setError("Auth Error");
+        }
+      } catch (e) {
+        setError("Connection Failed");
+      }
+    };
+    fetchData();
+    const interval = setInterval(fetchData, 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  if (error) return <div className="p-10 text-red-500 bg-slate-950 h-screen flex items-center justify-center font-mono">{error}</div>;
+  if (!data) return <div className="p-10 text-emerald-500 bg-slate-950 h-screen flex items-center justify-center font-mono animate-pulse">INITIALIZING NEURAL LINK...</div>;
+
+  return (
+    <Layout>
+      <div className="space-y-6">
+        {/* ROW 1: KEY METRICS */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          {/* Queue Depth */}
+          <Card className="bg-slate-900 border-slate-800 text-white">
+            <CardHeader className="pb-2"><CardTitle className="text-xs font-mono text-slate-400 uppercase tracking-widest">Queue Depth</CardTitle></CardHeader>
+            <CardContent>
+              <div className="text-4xl font-bold font-mono">{data.queue_depth}</div>
+              <p className="text-[10px] text-slate-500 uppercase mt-1">Pending Documents</p>
+            </CardContent>
+          </Card>
+
+          {/* GPU Load */}
+          <Card className="bg-slate-900 border-slate-800 text-white">
+            <CardHeader className="pb-2"><CardTitle className="text-xs font-mono text-slate-400 uppercase tracking-widest flex items-center gap-2"><Zap className="w-3 h-3 text-yellow-500"/> Tesla T4 Load</CardTitle></CardHeader>
+            <CardContent>
+              <div className="flex items-baseline gap-2">
+                <div className={`text-4xl font-bold font-mono ${data.system.gpu.load > 80 ? 'text-red-400' : 'text-emerald-400'}`}>{data.system.gpu.load}%</div>
+                <div className="text-[10px] text-slate-500 uppercase">Compute</div>
+              </div>
+              <div className="w-full bg-slate-800 h-1 mt-3 rounded-full overflow-hidden">
+                <div className="bg-emerald-500 h-full transition-all duration-300" style={{ width: `${data.system.gpu.load}%` }}></div>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* VRAM Usage */}
+          <Card className="bg-slate-900 border-slate-800 text-white">
+            <CardHeader className="pb-2"><CardTitle className="text-xs font-mono text-slate-400 uppercase tracking-widest">VRAM Usage</CardTitle></CardHeader>
+            <CardContent>
+               <div className="flex items-baseline gap-2">
+                <div className="text-4xl font-bold font-mono text-purple-400">{data.system.gpu.memory}%</div>
+                <div className="text-[10px] text-slate-500 uppercase">{Math.round(data.system.gpu.mem_used_mb / 1024)} GB / 15 GB</div>
+              </div>
+               <div className="w-full bg-slate-800 h-1 mt-3 rounded-full overflow-hidden">
+                <div className="bg-purple-500 h-full transition-all duration-300" style={{ width: `${data.system.gpu.memory}%` }}></div>
+              </div>
+            </CardContent>
+          </Card>
+          
+           {/* System RAM */}
+           <Card className="bg-slate-900 border-slate-800 text-white">
+            <CardHeader className="pb-2"><CardTitle className="text-xs font-mono text-slate-400 uppercase tracking-widest">System RAM</CardTitle></CardHeader>
+            <CardContent>
+              <div className="flex items-baseline gap-2">
+                <div className="text-4xl font-bold font-mono text-blue-400">{data.system.ram}%</div>
+                <div className="text-[10px] text-slate-500 uppercase">Usage</div>
+              </div>
+              <div className="w-full bg-slate-800 h-1 mt-3 rounded-full overflow-hidden">
+                <div className="bg-blue-500 h-full transition-all duration-300" style={{ width: `${data.system.ram}%` }}></div>
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* ROW 2: LOGS & WORKERS */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            {/* Logs Console */}
+            <Card className="md:col-span-2 bg-black border-slate-800 text-white">
+            <CardHeader className="border-b border-slate-800 py-3"><CardTitle className="text-xs font-mono uppercase tracking-widest flex items-center gap-2"><Activity className="w-3 h-3 text-green-500"/> Live Processing Stream</CardTitle></CardHeader>
+            <CardContent className="p-0">
+                <div className="font-mono text-[10px] md:text-xs h-64 overflow-hidden flex flex-col-reverse p-4 bg-black/50 relative">
+                {data.logs.map((log: string, i: number) => (
+                    <div key={i} className="mb-1 border-b border-white/5 pb-0.5 text-green-400/80 truncate">
+                    <span className="opacity-40 mr-3 text-slate-400">[{new Date().toLocaleTimeString()}]</span>
+                    {log.replace(/\[.*?\]/, '').trim()}
+                    </div>
+                ))}
+                </div>
+            </CardContent>
+            </Card>
+
+            {/* Worker Status List */}
+            <Card className="bg-slate-900 border-slate-800 text-white">
+                <CardHeader className="border-b border-slate-800 py-3"><CardTitle className="text-xs font-mono uppercase tracking-widest flex items-center gap-2"><Server className="w-3 h-3 text-blue-500"/> Worker Status</CardTitle></CardHeader>
+                <CardContent className="p-4 space-y-3">
+                    <div className="flex justify-between items-center text-xs font-mono">
+                        <span className="text-slate-400">Active Workers</span>
+                        <span className="text-emerald-400">{data.active_workers} Online</span>
+                    </div>
+                    <div className="flex justify-between items-center text-xs font-mono">
+                         <span className="text-slate-400">Status</span>
+                         <span className={`px-2 py-0.5 rounded text-[10px] uppercase font-bold ${data.status === 'processing' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-slate-800 text-slate-500'}`}>
+                             {data.status}
+                         </span>
+                    </div>
+                     <div className="pt-4 border-t border-slate-800">
+                        <div className="text-[10px] uppercase text-slate-500 mb-2 font-mono">Queue Breakdown</div>
+                        <div className="grid grid-cols-2 gap-2">
+                             <div className="bg-slate-950 p-2 rounded border border-slate-800">
+                                <div className="text-xs font-bold text-red-400">{data.queues.high}</div>
+                                <div className="text-[9px] text-slate-500 uppercase">High</div>
+                             </div>
+                             <div className="bg-slate-950 p-2 rounded border border-slate-800">
+                                <div className="text-xs font-bold text-blue-400">{data.queues.default}</div>
+                                <div className="text-[9px] text-slate-500 uppercase">Std</div>
+                             </div>
+                             <div className="bg-slate-950 p-2 rounded border border-slate-800">
+                                <div className="text-xs font-bold text-slate-400">{data.queues.low}</div>
+                                <div className="text-[9px] text-slate-500 uppercase">Low</div>
+                             </div>
+                             <div className="bg-slate-950 p-2 rounded border border-slate-800">
+                                <div className="text-xs font-bold text-orange-400">{data.queues.long_docs}</div>
+                                <div className="text-[9px] text-slate-500 uppercase">Long</div>
+                             </div>
+                        </div>
+                     </div>
+                </CardContent>
+            </Card>
+        </div>
+      </div>
+    </Layout>
+  );
+}
+5. generated_backend/daily_report.py
+The reporting script for daily summaries.
+
+Python
+
+import smtplib
+import subprocess
+import os
+import re
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from datetime import datetime
+
+# --- CONFIGURATION ---
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.office365.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER = os.getenv("SMTP_USER", "your_email@ampowersys.com")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "your_password")
+EMAIL_TO = "bengillihan@ampowersys.com"
+# ---------------------
+
+def get_logs():
+    # Fetch logs for the AI Worker from the last 24 hours (since midnight)
+    try:
+        # Note: 'today' in journalctl means 00:00:00 of the current day
+        cmd = ["journalctl", "-u", "ai-worker", "--since", "today", "--no-pager"]
+        result = subprocess.check_output(cmd, text=True)
+        return result.splitlines()
+    except subprocess.CalledProcessError as e:
+        print(f"Error fetching logs: {e}")
+        return []
+
+def analyze_logs(log_lines):
+    stats = {
+        "total_jobs": 0,
+        "success_jobs": 0,
+        "failed_jobs": 0,
+        "total_duration": 0.0,
+        "errors": []
+    }
+
+    for line in log_lines:
+        if "Processing Job:" in line:
+            stats["total_jobs"] += 1
+        
+        if "Job complete for" in line:
+            stats["success_jobs"] += 1
+            
+        if "Job failed for" in line:
+            stats["failed_jobs"] += 1
+            # Extract error message (everything after 'Job failed for ...:')
+            parts = line.split(":", 3)
+            if len(parts) > 3:
+                stats["errors"].append(parts[3].strip())
+            else:
+                stats["errors"].append(line)
+
+        # Look for the PERFORMANCE tag we added to worker.py
+        # Log format: ... PERFORMANCE: Job finished in 123.45 seconds
+        if "PERFORMANCE: Job finished in" in line:
+            match = re.search(r"finished in (\d+\.\d+) seconds", line)
+            if match:
+                stats["total_duration"] += float(match.group(1))
+
+    return stats
+
+def send_email(stats):
+    avg_time = 0
+    if stats["success_jobs"] > 0:
+        avg_time = stats["total_duration"] / stats["success_jobs"]
+
+    subject = f"AI Worker Daily Report - {datetime.now().strftime('%Y-%m-%d')}"
+    
+    body = f"""
+    <h2>Daily Processing Summary</h2>
+    <p><b>Date:</b> {datetime.now().strftime('%Y-%m-%d')}</p>
+    
+    <h3>Performance Metrics</h3>
+    <ul>
+        <li><b>Total Jobs Attempted:</b> {stats['total_jobs']}</li>
+        <li><b>Successful Jobs:</b> {stats['success_jobs']}</li>
+        <li><b>Failed Jobs:</b> {stats['failed_jobs']}</li>
+        <li><b>Average Processing Time:</b> {avg_time:.2f} seconds</li>
+    </ul>
+
+    <h3>Issues & Errors</h3>
+    { "<ul>" + "".join([f"<li>{e}</li>" for e in stats['errors']]) + "</ul>" if stats['errors'] else "<p>No errors recorded today.</p>" }
+    
+    <hr>
+    <p><i>Sent from Azure AI Processor</i></p>
+    """
+
+    msg = MIMEMultipart()
+    msg['From'] = SMTP_USER
+    msg['To'] = EMAIL_TO
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'html'))
+
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print("Report email sent successfully.")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+
+if __name__ == "__main__":
+    logs = get_logs()
+    if logs:
+        statistics = analyze_logs(logs)
+        send_email(statistics)
+    else:
+        print("No logs found for today.")
