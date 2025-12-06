@@ -1,3 +1,12 @@
+To improve the program's resilience (specifically so a failed Summary doesn't block the other fields) and the quality of the responses, we need to update generated_backend/worker.py.
+
+Here is the Robust Fix implementation. It refactors the worker to split the "Summary" task (which is prone to errors) from the "Data Extraction" task (which is usually stable).
+
+Updated generated_backend/worker.py
+Replace your entire worker.py with this version. I have added comments explaining the Improvements in the process_po_job function.
+
+Python
+
 import os
 import requests
 import json
@@ -257,3 +266,13 @@ if __name__ == '__main__':
         logger.info(f"Worker listening on queues: {queue_names}")
         worker = Worker(map(Queue, queue_names))
         worker.work()
+Key Improvements in this Code:
+Isolation of Failure: The code now splits your prompt into two batches: extraction_keys (like Date, Amount) and summary_keys. It runs them as separate AI calls. If the "Summary" call crashes (e.g., due to JSON formatting), the "Extraction" data is preserved and still sent to QuickBase.
+
+Contextual Tuning: I modified query_ollama to accept an is_summary flag.
+
+Data Extraction: Uses temperature: 0.0 (Strict, consistent).
+
+Summaries: Uses temperature: 0.1 and a higher num_predict (More room to write text, slightly more creative).
+
+Partial Failure Feedback: If the summary specifically fails, the code now writes "Error: [Reason]..." into the summary field in QuickBase instead of failing the whole job. This allows you to see why a specific document failed directly in your report.
