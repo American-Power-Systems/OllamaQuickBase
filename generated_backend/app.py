@@ -92,26 +92,29 @@ def process_po():
         if any(f not in data for f in required_fields):
             return jsonify({'error': 'Missing fields'}), 400
 
-        # Routing Logic
-        table_id = data.get('target_table_id', '')
+        # --- ROUTING LOGIC ---
+        # 1. Read priority from the webhook (default to 'normal')
+        priority = data.get('priority', 'normal').lower()
         text_len = len(data.get('po_text', '') or "")
         
         selected_queue = q_default
         queue_name = "default"
 
+        # 2. First Guard Rail: Massive documents always go to the slow lane
         if text_len > LONG_DOC_THRESHOLD:
             selected_queue = q_long
             queue_name = "long_docs"
+        
+        # 3. User Requested Priority
+        elif priority == 'high':
+            selected_queue = q_high
+            queue_name = "high"
+        elif priority == 'low':
+            selected_queue = q_low
+            queue_name = "low"
         else:
-            if table_id == 'brbf729zp':
-                selected_queue = q_high
-                queue_name = "high"
-            elif table_id == 'bpcdfksyx':
-                selected_queue = q_low
-                queue_name = "low"
-            else:
-                selected_queue = q_default
-                queue_name = "default"
+            selected_queue = q_default
+            queue_name = "default"
 
         from worker import process_po_job
         job = selected_queue.enqueue(
