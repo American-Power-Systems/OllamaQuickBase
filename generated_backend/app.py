@@ -3,76 +3,87 @@ from redis import Redis
 from rq import Queue, Worker
 import os
 import logging
+import psutil
+import subprocess
+import shutil
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# 1. SECURITY: Enforce API Key
+# SECURITY
 API_KEY = os.getenv('API_KEY')
-if not API_KEY:
-    # Fallback for safety if env var is missing (optional, but good for stability)
-    API_KEY = 'q#*3VyUK6&ih63xZ' 
 
-# Redis connection
+# Redis Connection
 redis_conn = Redis(
     host=os.getenv('REDIS_HOST', 'localhost'),
     port=int(os.getenv('REDIS_PORT', 6379)),
     password=os.getenv('REDIS_PASSWORD', None)
 )
 
-# Define Queues
+# Queues
 q_high = Queue('high', connection=redis_conn)
 q_default = Queue('default', connection=redis_conn)
 q_low = Queue('low', connection=redis_conn)
 q_long = Queue('long_docs', connection=redis_conn)
 
-LONG_DOC_THRESHOLD = 20000
+def get_gpu_stats():
+    """Parses nvidia-smi for GPU usage."""
+    if not shutil.which('nvidia-smi'):
+        return {"load": 0, "memory": 0, "mem_used_mb": 0}
+    try:
+        # Get GPU Load and Memory Used
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"],
+            encoding='utf-8'
+        )
+        util, mem_used, mem_total = map(int, output.strip().split(', '))
+        mem_percent = round((mem_used / mem_total) * 100, 1)
+        return {"load": util, "memory": mem_percent, "mem_used_mb": mem_used}
+    except Exception:
+        return {"load": 0, "memory": 0, "mem_used_mb": 0}
 
 @app.route('/api/status', methods=['GET'])
 def get_status():
-    """
-    Returns the health, queue depths, and ACTIVE WORKER details.
-    """
     client_key = request.headers.get('X-API-Key')
     if client_key != API_KEY:
+        # Strict security: Require key even for dashboard
         return jsonify({'error': 'Unauthorized'}), 401
 
     try:
-        # 1. Fetch Logs
-        raw_logs = redis_conn.lrange("monitor_logs", 0, 49)
+        # 1. Redis Logs
+        raw_logs = redis_conn.lrange("monitor_logs", 0, 19)
         logs = [log.decode('utf-8') for log in raw_logs]
-        
-        # 2. Calculate Depths
-        total_depth = len(q_high) + len(q_default) + len(q_low) + len(q_long)
 
-        # 3. Fetch REAL Worker Stats (This is the missing piece!)
+        # 2. Queue Depths
+        queues = {
+            "high": len(q_high),
+            "default": len(q_default),
+            "low": len(q_low),
+            "long_docs": len(q_long)
+        }
+        total_depth = sum(queues.values())
+
+        # 3. Worker Status
         workers = Worker.all(connection=redis_conn)
-        worker_list = []
-        for w in workers:
-            # Get the specific job ID if busy
-            current_job = w.get_current_job_id()
-            
-            worker_list.append({
-                "name": w.name,  # e.g. "worker.1234"
-                "state": w.state, # "busy" or "idle"
-                "queues": w.queue_names(), # e.g. ["high", "default"]
-                "current_job": current_job or "Waiting..."
-            })
+        active_count = sum(1 for w in workers if w.state == 'busy')
+        
+        # 4. System Resources
+        sys_stats = {
+            "cpu": psutil.cpu_percent(interval=None),
+            "ram": psutil.virtual_memory().percent,
+            "gpu": get_gpu_stats()
+        }
 
         return jsonify({
-            "status": "online",
+            "status": "online" if active_count > 0 else "idle",
             "queue_depth": total_depth,
-            "queues": {
-                "high": len(q_high),
-                "default": len(q_default),
-                "low": len(q_low),
-                "long_docs": len(q_long)
-            },
             "active_workers": len(workers),
-            "worker_details": worker_list, # <--- The dashboard needs this
+            "working_count": active_count,
+            "queues": queues,
+            "system": sys_stats,
             "logs": logs
         })
     except Exception as e:
@@ -92,20 +103,17 @@ def process_po():
         if any(f not in data for f in required_fields):
             return jsonify({'error': 'Missing fields'}), 400
 
-        # --- ROUTING LOGIC ---
-        # 1. Read priority from the webhook (default to 'normal')
+        # Routing Logic
         priority = data.get('priority', 'normal').lower()
         text_len = len(data.get('po_text', '') or "")
+        LONG_DOC_THRESHOLD = 20000
         
         selected_queue = q_default
         queue_name = "default"
 
-        # 2. First Guard Rail: Massive documents always go to the slow lane
         if text_len > LONG_DOC_THRESHOLD:
             selected_queue = q_long
             queue_name = "long_docs"
-        
-        # 3. User Requested Priority
         elif priority == 'high':
             selected_queue = q_high
             queue_name = "high"
